@@ -26,8 +26,8 @@ function getSb() {
 const FolderSaver = {
   DB_NAME: "CotizadorFS",
   DB_STORE: "handles",
-  DB_KEY: "pdfFolder_2026_dropbox",
-  RESET_FLAG: "fs_reset_v2026_dropbox_v1",
+  DB_KEY: "pdfFolder_2026_dropbox_v3",
+  RESET_FLAG: "fs_reset_v2026_dropbox_v3",
 
   // Abre (o crea) la base IndexedDB donde guardamos los handles de carpetas
   _openIDB() {
@@ -83,7 +83,7 @@ const FolderSaver = {
     }
   },
 
-  // API pública: guarda el blob en la carpeta elegida
+  // API pública: guarda el blob directamente en la carpeta elegida
   // Retorna true si guardó en carpeta, false si usó descarga normal
   async saveBlob(blob, filename) {
     // Si el navegador no soporta la API → descarga normal
@@ -94,28 +94,15 @@ const FolderSaver = {
 
     let dirHandle = await this._getHandle();
 
-    // Si no hay carpeta guardada o el permiso venció → pedir carpeta
+    // Si no hay carpeta guardada o el permiso venció → abrir modal para configurar y sugerir ruta
     if (!dirHandle || !(await this._verifyPermission(dirHandle, "readwrite"))) {
-      try {
-        dirHandle = await window.showDirectoryPicker({
-          id: "cotizacion-nueva-dropbox",
-          mode: "readwrite",
-          startIn: "documents"
-        });
-        await this._saveHandle(dirHandle);
-      } catch (err) {
-        // Usuario canceló el selector → descarga normal
-        this._fallbackDownload(blob, filename);
-        return false;
-      }
+      this.openModal();
+      return false;
     }
 
-    // Determinar la carpeta destino ("PDF" dentro de "COTIZACION NUEVA")
-    const targetDir = await this._getTargetDir(dirHandle);
-
-    // Escribir el archivo en la carpeta
+    // Escribir el archivo directamente en la carpeta seleccionada (COTIZACION NUEVA)
     try {
-      const fileHandle = await targetDir.getFileHandle(filename, { create: true });
+      const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
@@ -136,21 +123,6 @@ const FolderSaver = {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 4000);
-  },
-
-  // Obtiene el directorio destino real (subcarpeta "PDF" si existe dentro de "COTIZACION NUEVA")
-  async _getTargetDir(dirHandle) {
-    if (!dirHandle) return null;
-    if (dirHandle.name.toLowerCase() === "pdf") {
-      return dirHandle;
-    }
-    try {
-      // Si seleccionaron "COTIZACION NUEVA", usar su subcarpeta "PDF"
-      const sub = await dirHandle.getDirectoryHandle("PDF", { create: true });
-      return sub;
-    } catch (e) {
-      return dirHandle;
-    }
   },
 
   openModal() {
@@ -174,12 +146,7 @@ const FolderSaver = {
     try {
       const h = await this._getHandle();
       if (h) {
-        let name = h.name;
-        try {
-          const sub = await h.getDirectoryHandle("PDF", { create: false });
-          name = `${h.name} / ${sub.name}`;
-        } catch {}
-        btn.innerHTML = `📁 Carpeta: ${name} <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-left:4px;" title="Carpeta conectada"></span>`;
+        btn.innerHTML = `📁 Carpeta: ${h.name} <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-left:4px;" title="Carpeta conectada"></span>`;
       } else {
         btn.innerHTML = `📁 Carpeta PDF <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59e0b;margin-left:4px;" title="Pendiente de configurar"></span>`;
       }
@@ -192,14 +159,12 @@ const FolderSaver = {
         const db = await this._openIDB();
         const tx = db.transaction(this.DB_STORE, "readwrite");
         const store = tx.objectStore(this.DB_STORE);
-        store.delete("pdfFolder");
-        store.delete("pdfFolder_2026");
-        store.delete(this.DB_KEY);
+        store.clear();
       } catch (e) {
         console.warn("Reseteando handles:", e);
       }
       localStorage.setItem(this.RESET_FLAG, "true");
-      console.log("🧹 Carpeta previa reseteada en este equipo.");
+      console.log("🧹 Carpeta previa reseteada en todos los equipos.");
     }
     await this.updateStatusUI();
   },
@@ -216,13 +181,8 @@ const FolderSaver = {
         startIn: "documents"
       });
       await this._saveHandle(dirHandle);
-      let targetName = dirHandle.name;
-      try {
-        const sub = await dirHandle.getDirectoryHandle("PDF", { create: true });
-        targetName = `${dirHandle.name} / ${sub.name}`;
-      } catch {}
       await this.updateStatusUI();
-      toast(`✅ Carpeta configurada: ${targetName}`);
+      toast(`✅ Carpeta configurada: ${dirHandle.name}`);
     } catch { /* cancelado */ }
   }
 };
