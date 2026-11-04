@@ -639,6 +639,40 @@ function bumpNumero(numero) {
   return parts.join("-");
 }
 
+// Último consecutivo real en la nube (null si no se pudo consultar)
+async function fetchMaxNumeroCloud(sb, year) {
+  if (!sb) return null;
+  let maxN = 0;
+  let from = 0;
+  const step = 1000;
+  for (;;) {
+    const { data, error } = await sb.from("cotizaciones")
+      .select("numero")
+      .like("numero", `C-${year}-%`)
+      .order("numero", { ascending: true })
+      .range(from, from + step - 1);
+    if (error) return null;
+    if (!data || !data.length) break;
+    for (const r of data) {
+      const m = String(r.numero || "").match(/^C-(\d{4})-(\d+)$/);
+      if (m && Number(m[1]) === year) maxN = Math.max(maxN, parseInt(m[2], 10));
+    }
+    if (data.length < step) break;
+    from += step;
+  }
+  return maxN;
+}
+
+// Siguiente número consultando la nube en el momento de guardar;
+// si la nube no responde, se usa la lista local como respaldo
+async function nextNumeroCloud(sb) {
+  const year = new Date().getFullYear();
+  const localNext = parseInt(String(DB.nextNumero()).split("-").pop(), 10) || 1;
+  const cloudMax = await fetchMaxNumeroCloud(sb, year);
+  const next = cloudMax == null ? localNext : Math.max(localNext, cloudMax + 1);
+  return `C-${year}-${next}`;
+}
+
 const DEFAULT_OBSERVACIONES =
   "Favor consignar a: Bancolombia – Cuenta de Ahorros N.º 72600001670, a nombre de Representaciones M&M Medical SAS.\n\n" +
   "No somos grandes contribuyentes ni autorretenedores de renta.\n\n" +
@@ -2321,12 +2355,12 @@ const Cotizador = {
     });
 
     const isEdit = !!this._editingNumero;
-    let numero = this._editingNumero || DB.nextNumero();
+    const sb = getSb();
+    let numero = this._editingNumero || await nextNumeroCloud(sb);
 
     const isShowingImages = Boolean(data.showImages || items.some(it => it.imagen && String(it.imagen).trim().length > 0));
     const record = { numero, ...data, showImages: isShowingImages, items, subtotal, iva, total: subtotal + iva };
 
-    const sb = getSb();
     let cloudSaved = !sb ? false : false;
     let cloudErrorMsg = "";
 
@@ -2438,7 +2472,8 @@ const Cotizador = {
     const source = DB.getCotizaciones().find(c => c.numero === numero);
     if (!source) return toast("No se encontró la cotización para duplicar.", true);
 
-    const newNumero = DB.nextNumero();
+    const sb = getSb();
+    const newNumero = await nextNumeroCloud(sb);
     const _now = new Date();
     const hoy = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
 
@@ -2447,7 +2482,6 @@ const Cotizador = {
     copy.numero = newNumero;
     copy.fecha = hoy;
 
-    const sb = getSb();
     let cloudSaved = false;
     let cloudErrorMsg = "";
 
