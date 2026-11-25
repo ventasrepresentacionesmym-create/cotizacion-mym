@@ -92,11 +92,19 @@ const FolderSaver = {
       return false;
     }
 
-    let dirHandle = await this._getHandle();
+    let dirHandle = null;
+    try {
+      dirHandle = await this._getHandle();
+    } catch (e) {
+      console.warn("Error obteniendo handle de carpeta:", e);
+    }
 
-    // Si no hay carpeta guardada o el permiso venció → abrir modal para configurar y sugerir ruta
+    // Si no hay carpeta guardada o el permiso venció → descargar y sugerir configuración
     if (!dirHandle || !(await this._verifyPermission(dirHandle, "readwrite"))) {
-      this.openModal();
+      this._fallbackDownload(blob, filename);
+      if (!dirHandle) {
+        this.openModal();
+      }
       return false;
     }
 
@@ -1783,7 +1791,9 @@ Views.renderGuardadas = function () {
 /* ---------- 📝 NUEVA / EDITAR COTIZACIÓN ---------- */
 Views.renderNueva = function (numeroToLoad) {
   const el = document.getElementById("view-nueva");
-  const existing = numeroToLoad ? DB.getCotizaciones().find(c => c.numero === numeroToLoad) : null;
+  const existing = numeroToLoad
+    ? DB.getCotizaciones().find(c => String(c.numero || "").trim().toUpperCase() === String(numeroToLoad || "").trim().toUpperCase())
+    : null;
   const isEdit = !!existing;
   const source = isEdit ? existing : null;
   const numeroDisplay = isEdit ? existing.numero : "Se asigna al guardar";
@@ -1817,7 +1827,7 @@ Views.renderNueva = function (numeroToLoad) {
 
     <div class="card">
       <div class="grid g4">
-        <div><label>N.°</label><input value="${numeroDisplay}" disabled style="font-family:var(--mono);background:#f3f4f3;font-weight:700;color:var(--azul-950)"></div>
+        <div><label>N.°</label><input id="f_numero_display" data-numero="${isEdit ? esc(existing.numero) : ''}" value="${numeroDisplay}" disabled style="font-family:var(--mono);background:#f3f4f3;font-weight:700;color:var(--azul-950)"></div>
         <div><label>Fecha</label><input id="f_fecha" type="date" value="${source ? source.fecha : hoy}"></div>
         <div class="field">
           <label>Cliente *</label>
@@ -1923,12 +1933,12 @@ Views.renderNueva = function (numeroToLoad) {
       })() : DEFAULT_OBSERVACIONES)}</textarea>
     </div>
 
-    <div class="btn-row">
-      <button class="btn btn-ghost" onclick="Cotizador.save(false)">${isEdit ? "Guardar cambios" : "Guardar cotización"}</button>
-      <button class="btn btn-accent" onclick="Cotizador.save(true)">${isEdit ? "Guardar cambios y descargar PDF" : "Guardar y generar PDF"}</button>
-      ${isEdit ? `<button class="btn btn-danger" id="btnEliminar">Eliminar cotización</button>` : ""}
-      ${isEdit ? `<button class="btn btn-ghost" id="btnDuplicar" style="border-color:#bae6fd;color:#0369a1;">📋 Duplicar cotización</button>` : ""}
-      <button class="btn btn-ghost" onclick="Router.go('guardadas')" style="margin-left:auto">Ver cotizaciones guardadas</button>
+    <div class="btn-row" id="cotizadorActions">
+      <button type="button" class="btn btn-ghost" id="btnGuardar" onclick="Cotizador.save(false)">${isEdit ? "Guardar cambios" : "Guardar cotización"}</button>
+      <button type="button" class="btn btn-accent" id="btnGuardarPdf" onclick="Cotizador.save(true)">${isEdit ? "Guardar cambios y descargar PDF" : "Guardar y generar PDF"}</button>
+      ${isEdit ? `<button type="button" class="btn btn-danger" id="btnEliminar" onclick="Cotizador.remove()">Eliminar cotización</button>` : ""}
+      ${isEdit ? `<button type="button" class="btn btn-ghost" id="btnDuplicar" style="border-color:#bae6fd;color:#0369a1;" onclick="Cotizador.duplicate()">📋 Duplicar cotización</button>` : ""}
+      <button type="button" class="btn btn-ghost" onclick="Router.go('guardadas')" style="margin-left:auto">Ver cotizaciones guardadas</button>
     </div>
   `;
 
@@ -1953,16 +1963,6 @@ Views.renderNueva = function (numeroToLoad) {
     ItemsUI.items = [{ codigo: "", descripcion: "", cantidad: 1, vrUnitario: 0, ivaPct: 0.19, costo: 0, porcentaje: 0.25, proveedor: "", imagen: "" }];
   }
   ItemsUI.paint();
-
-  const btnEliminar = document.getElementById("btnEliminar");
-  if (btnEliminar && isEdit) {
-    btnEliminar.addEventListener("click", () => Cotizador.remove(existing.numero));
-  }
-
-  const btnDuplicar = document.getElementById("btnDuplicar");
-  if (btnDuplicar && isEdit) {
-    btnDuplicar.addEventListener("click", () => Cotizador.duplicate(existing.numero));
-  }
 
   attachAutocomplete(
     document.getElementById("f_cliente"), document.getElementById("ac_cliente"),
@@ -2257,6 +2257,31 @@ ItemsUI.recalc = function () {
    ============================================================ */
 const Cotizador = {
   _editingNumero: null,
+  _isBusy: false,
+
+  _updateButtonsBusy(busy, activeBtnId, busyText) {
+    const ids = ["btnGuardar", "btnGuardarPdf", "btnEliminar", "btnDuplicar"];
+    ids.forEach(id => {
+      const b = document.getElementById(id);
+      if (!b) return;
+      b.disabled = busy;
+      if (busy) {
+        b.style.opacity = "0.6";
+        b.style.pointerEvents = "none";
+        if (id === activeBtnId && busyText) {
+          b.dataset.origText = b.textContent;
+          b.textContent = busyText;
+        }
+      } else {
+        b.style.opacity = "";
+        b.style.pointerEvents = "";
+        if (b.dataset.origText) {
+          b.textContent = b.dataset.origText;
+          delete b.dataset.origText;
+        }
+      }
+    });
+  },
 
   collect() {
     return {
@@ -2328,6 +2353,8 @@ const Cotizador = {
   },
 
   async save(withPdf) {
+    if (this._isBusy) return;
+
     const data = this.collect();
     const missing = this.validate(data, withPdf);
 
@@ -2354,88 +2381,140 @@ const Cotizador = {
       iva += vt * ivaP;
     });
 
-    const isEdit = !!this._editingNumero;
-    const sb = getSb();
-    let numero = this._editingNumero || await nextNumeroCloud(sb);
+    const editNumero = this._editingNumero || (document.getElementById("f_numero_display") ? document.getElementById("f_numero_display").dataset.numero : null);
+    const isEdit = Boolean(editNumero);
 
-    const isShowingImages = Boolean(data.showImages || items.some(it => it.imagen && String(it.imagen).trim().length > 0));
-    const record = { numero, ...data, showImages: isShowingImages, items, subtotal, iva, total: subtotal + iva };
+    this._isBusy = true;
+    this._updateButtonsBusy(
+      true,
+      withPdf ? "btnGuardarPdf" : "btnGuardar",
+      withPdf ? (isEdit ? "Guardando y generando PDF..." : "Generando PDF...") : (isEdit ? "Guardando cambios..." : "Guardando...")
+    );
 
-    let cloudSaved = !sb ? false : false;
-    let cloudErrorMsg = "";
+    try {
+      const sb = getSb();
+      let numero = editNumero || await nextNumeroCloud(sb);
 
-    // Nueva: reservar número en la nube con reintentos si choca (evita sobrescribir a otro usuario)
-    if (!isEdit && sb) {
-      let row = this.toDbRow(record);
-      for (let t = 0; t < 50; t++) {
-        let { error } = await sb.from("cotizaciones").insert(row);
-        if (!error) {
-          cloudSaved = true;
-          break;
-        }
-        const msg = error.message || "";
-        if (error.code === "23505") {
-          numero = bumpNumero(numero);
-          record.numero = numero;
-          row = this.toDbRow(record);
-        } else if (/contacto/i.test(msg)) {
-          delete row.contacto;
-        } else if (/show_images/i.test(msg)) {
-          delete row.show_images;
-        } else {
-          cloudErrorMsg = msg;
-          console.warn("Advertencia al guardar en Supabase:", error);
-          break;
-        }
-      }
-    }
+      const isShowingImages = Boolean(data.showImages || items.some(it => it.imagen && String(it.imagen).trim().length > 0));
+      const record = { numero, ...data, showImages: isShowingImages, items, subtotal, iva, total: subtotal + iva };
 
-    // Edición: sincronizar con la nube
-    if (isEdit && sb) {
-      try {
+      let cloudSaved = false;
+      let cloudErrorMsg = "";
+
+      // Nueva: reservar número en la nube con reintentos si choca (evita sobrescribir a otro usuario)
+      if (!isEdit && sb) {
         let row = this.toDbRow(record);
-        let { error } = await sb.from("cotizaciones").upsert(row, { onConflict: "numero" });
-        if (error && /contacto/i.test(error.message || "")) {
-          delete row.contacto;
-          ({ error } = await sb.from("cotizaciones").upsert(row, { onConflict: "numero" }));
+        const badCols = new Set();
+        for (let t = 0; t < 50; t++) {
+          let testRow = { ...row };
+          badCols.forEach(col => delete testRow[col]);
+          let { error } = await sb.from("cotizaciones").insert(testRow);
+          if (!error) {
+            cloudSaved = true;
+            break;
+          }
+          const msg = error.message || "";
+          if (error.code === "23505") {
+            numero = bumpNumero(numero);
+            record.numero = numero;
+            row = this.toDbRow(record);
+          } else if (/contacto/i.test(msg)) {
+            badCols.add("contacto");
+          } else if (/show_images/i.test(msg)) {
+            badCols.add("show_images");
+          } else {
+            const colM = msg.match(/column "?([a-zA-Z0-9_]+)"?/i);
+            if (colM && colM[1] && row.hasOwnProperty(colM[1])) {
+              badCols.add(colM[1]);
+            } else {
+              cloudErrorMsg = msg;
+              console.warn("Advertencia al guardar en Supabase:", error);
+              break;
+            }
+          }
         }
-        if (error && /show_images/i.test(error.message || "")) {
-          delete row.show_images;
-          ({ error } = await sb.from("cotizaciones").upsert(row, { onConflict: "numero" }));
-        }
-        if (!error) {
-          cloudSaved = true;
-        } else {
-          cloudErrorMsg = error.message || "";
-          console.warn("Advertencia al actualizar en Supabase:", error);
-        }
-      } catch (e) {
-        cloudErrorMsg = e.message || "";
-        console.warn("Error guardando en Supabase:", e);
       }
+
+      // Edición: sincronizar con la nube (primero UPDATE por número; si no existe en nube, INSERT)
+      if (isEdit && sb) {
+        try {
+          let row = this.toDbRow(record);
+          const badCols = new Set();
+          let updated = false;
+
+          for (let t = 0; t < 5; t++) {
+            let testRow = { ...row };
+            badCols.forEach(col => delete testRow[col]);
+            let { data: upData, error } = await sb.from("cotizaciones").update(testRow).eq("numero", record.numero).select("numero");
+            if (!error) {
+              if (upData && upData.length > 0) {
+                updated = true;
+                cloudSaved = true;
+                break;
+              } else {
+                break;
+              }
+            }
+            const msg = error.message || "";
+            if (/contacto/i.test(msg)) badCols.add("contacto");
+            else if (/show_images/i.test(msg)) badCols.add("show_images");
+            else {
+              const colM = msg.match(/column "?([a-zA-Z0-9_]+)"?/i);
+              if (colM && colM[1] && row.hasOwnProperty(colM[1])) {
+                badCols.add(colM[1]);
+              } else {
+                cloudErrorMsg = msg;
+                break;
+              }
+            }
+          }
+
+          if (!updated && !cloudSaved) {
+            // Intentar upsert o insert como respaldo
+            let testRow = { ...row };
+            badCols.forEach(col => delete testRow[col]);
+            let { error: insErr } = await sb.from("cotizaciones").upsert(testRow, { onConflict: "numero" });
+            if (!insErr) {
+              cloudSaved = true;
+            } else {
+              cloudErrorMsg = insErr.message || cloudErrorMsg;
+              console.warn("Advertencia al actualizar en Supabase:", insErr);
+            }
+          }
+        } catch (e) {
+          cloudErrorMsg = e.message || "";
+          console.warn("Error guardando en Supabase:", e);
+        }
+      }
+
+      // Guardar en memoria y caché local
+      const all = [...DB.getCotizaciones()];
+      const idx = all.findIndex(c => String(c.numero || "").trim() === String(record.numero || "").trim());
+      if (idx >= 0) all[idx] = record;
+      else all.push(record);
+      DB.setCotizaciones(all);
+
+      persistStateLocal();
+
+      if (sb && !cloudSaved) {
+        toast(`⚠️ Cotización ${record.numero} guardada en este equipo, pero no se pudo sincronizar en la nube${cloudErrorMsg ? ": " + cloudErrorMsg : ""}`, true);
+      } else {
+        toast(isEdit ? `Cotización ${record.numero} actualizada` : `Cotización ${record.numero} guardada`);
+      }
+
+      if (withPdf) {
+        await this.writePdf(record);
+      }
+
+      this._editingNumero = null;
+      Router.go("guardadas");
+    } catch (err) {
+      console.error("Error al guardar cotización:", err);
+      toast("Error al guardar: " + (err.message || err), true);
+    } finally {
+      this._isBusy = false;
+      this._updateButtonsBusy(false);
     }
-
-    // Guardar en memoria y caché local
-    const all = [...DB.getCotizaciones()];
-    const idx = all.findIndex(c => c.numero === record.numero);
-    if (idx >= 0) all[idx] = record;
-    else all.push(record);
-    DB.setCotizaciones(all);
-
-    this._editingNumero = null;
-    persistStateLocal();
-
-    if (sb && !cloudSaved) {
-      toast(`⚠️ Cotización ${record.numero} guardada en este equipo, pero no se pudo sincronizar en la nube${cloudErrorMsg ? ": " + cloudErrorMsg : ""}`, true);
-    } else {
-      toast(isEdit ? `Cotización ${record.numero} actualizada` : `Cotización ${record.numero} guardada`);
-    }
-
-    if (withPdf) {
-      await this.writePdf(record);
-    }
-
-    Router.go("guardadas");
   },
 
   toDbRow(r) {
@@ -2469,75 +2548,160 @@ const Cotizador = {
   },
 
   async duplicate(numero) {
-    const source = DB.getCotizaciones().find(c => c.numero === numero);
-    if (!source) return toast("No se encontró la cotización para duplicar.", true);
+    if (this._isBusy) return;
+    numero = numero || this._editingNumero || (document.getElementById("f_numero_display") ? document.getElementById("f_numero_display").dataset.numero : null);
+    const source = numero ? DB.getCotizaciones().find(c => String(c.numero || "").trim() === String(numero || "").trim()) : null;
+    if (!source && !this._editingNumero) {
+      return toast("No se encontró la cotización para duplicar.", true);
+    }
 
-    const sb = getSb();
-    const newNumero = await nextNumeroCloud(sb);
-    const _now = new Date();
-    const hoy = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
+    this._isBusy = true;
+    this._updateButtonsBusy(true, "btnDuplicar", "Duplicando...");
 
-    // Clonar profundo (sin referencia a la original)
-    const copy = JSON.parse(JSON.stringify(source));
-    copy.numero = newNumero;
-    copy.fecha = hoy;
+    try {
+      const sb = getSb();
+      let newNumero = await nextNumeroCloud(sb);
+      const _now = new Date();
+      const hoy = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
 
-    let cloudSaved = false;
-    let cloudErrorMsg = "";
+      const currentData = this.collect();
+      const currentItems = ItemsUI.items.filter(it => (it.codigo && String(it.codigo).trim()) || (it.descripcion && String(it.descripcion).trim()) || (it.imagen && String(it.imagen).trim()));
 
-    if (sb) {
-      let row = this.toDbRow(copy);
-      for (let t = 0; t < 50; t++) {
-        let { error } = await sb.from("cotizaciones").insert(row);
-        if (!error) { cloudSaved = true; break; }
-        const msg = error.message || "";
-        if (error.code === "23505") {
-          copy.numero = bumpNumero(copy.numero);
-          row = this.toDbRow(copy);
-        } else if (/contacto/i.test(msg)) {
-          delete row.contacto;
-        } else if (/show_images/i.test(msg)) {
-          delete row.show_images;
-        } else {
-          cloudErrorMsg = msg;
-          console.warn("Error duplicando en Supabase:", error);
-          break;
+      // Usar los productos y datos actuales de la pantalla si existen para no perder cambios recientes
+      const useItems = (currentItems.length > 0) ? currentItems : ((source && source.items) || []);
+      let subtotal = 0, iva = 0;
+      useItems.forEach(it => {
+        const cant = Number(it.cantidad) || 0;
+        const vu = Number(it.vrUnitario) || 0;
+        const ivaP = Number(it.ivaPct) || 0;
+        const vt = cant * vu;
+        subtotal += vt;
+        iva += vt * ivaP;
+      });
+
+      const isShowingImages = Boolean(currentData.showImages || useItems.some(it => it.imagen && String(it.imagen).trim().length > 0));
+
+      const copy = {
+        numero: newNumero,
+        fecha: hoy,
+        cliente: currentData.cliente || (source && source.cliente) || "",
+        nit: currentData.nit || (source && source.nit) || "",
+        ciudad: currentData.ciudad || (source && source.ciudad) || "",
+        contacto: currentData.contacto || (source && source.contacto) || "",
+        asesor: currentData.asesor || (source && source.asesor) || "",
+        tiempoEntrega: currentData.tiempoEntrega || (source && source.tiempoEntrega) || "",
+        formaPago: currentData.formaPago || (source && source.formaPago) || "",
+        validez: currentData.validez || (source && source.validez) || "",
+        observaciones: (currentData.observaciones != null && currentData.observaciones !== "") ? currentData.observaciones : ((source && source.observaciones) || ""),
+        observacionesProductos: (currentData.observacionesProductos != null && currentData.observacionesProductos !== "") ? currentData.observacionesProductos : ((source && source.observacionesProductos) || ""),
+        showImages: isShowingImages,
+        items: JSON.parse(JSON.stringify(useItems)),
+        subtotal,
+        iva,
+        total: subtotal + iva
+      };
+
+      let cloudSaved = false;
+      let cloudErrorMsg = "";
+
+      if (sb) {
+        let row = this.toDbRow(copy);
+        const badCols = new Set();
+        for (let t = 0; t < 50; t++) {
+          let testRow = { ...row };
+          badCols.forEach(col => delete testRow[col]);
+          let { error } = await sb.from("cotizaciones").insert(testRow);
+          if (!error) {
+            cloudSaved = true;
+            break;
+          }
+          const msg = error.message || "";
+          if (error.code === "23505") {
+            newNumero = bumpNumero(newNumero);
+            copy.numero = newNumero;
+            row = this.toDbRow(copy);
+          } else if (/contacto/i.test(msg)) {
+            badCols.add("contacto");
+          } else if (/show_images/i.test(msg)) {
+            badCols.add("show_images");
+          } else {
+            const colM = msg.match(/column "?([a-zA-Z0-9_]+)"?/i);
+            if (colM && colM[1] && row.hasOwnProperty(colM[1])) {
+              badCols.add(colM[1]);
+            } else {
+              cloudErrorMsg = msg;
+              console.warn("Error duplicando en Supabase:", error);
+              break;
+            }
+          }
         }
       }
+
+      // Guardar en memoria local
+      const all = [...DB.getCotizaciones()];
+      all.push(copy);
+      DB.setCotizaciones(all);
+
+      if (sb && !cloudSaved) {
+        toast(`⚠️ Cotización ${copy.numero} duplicada localmente, pero no se pudo guardar en la nube${cloudErrorMsg ? ": " + cloudErrorMsg : ""}`, true);
+      } else {
+        toast(`✅ Cotización duplicada como ${copy.numero}`);
+      }
+
+      // Abrir la copia para que el usuario pueda editarla de inmediato
+      Router.go("nueva", { record: copy.numero });
+    } catch (err) {
+      console.error("Error al duplicar cotización:", err);
+      toast("Error al duplicar: " + (err.message || err), true);
+    } finally {
+      this._isBusy = false;
+      this._updateButtonsBusy(false);
     }
-
-    // Guardar en memoria local
-    const all = [...DB.getCotizaciones()];
-    all.push(copy);
-    DB.setCotizaciones(all);
-
-    if (sb && !cloudSaved) {
-      toast(`⚠️ Cotización ${copy.numero} duplicada localmente, pero no se pudo guardar en la nube${cloudErrorMsg ? ": " + cloudErrorMsg : ""}`, true);
-    } else {
-      toast(`✅ Cotización duplicada como ${copy.numero}`);
-    }
-
-    // Abrir la copia para que el usuario pueda editarla de inmediato
-    Router.go("nueva", { record: copy.numero });
   },
 
   async remove(numero) {
+    if (this._isBusy) return;
+    numero = numero || this._editingNumero || (document.getElementById("f_numero_display") ? document.getElementById("f_numero_display").dataset.numero : null);
+    if (!numero) {
+      return toast("No se encontró el número de la cotización a eliminar.", true);
+    }
     if (!confirm(`¿Estás seguro de que deseas eliminar la cotización ${numero}? Esta acción no se puede deshacer.`)) {
       return;
     }
+
+    this._isBusy = true;
+    this._updateButtonsBusy(true, "btnEliminar", "Eliminando...");
+
+    let cloudDeleted = false;
+    let cloudErrorMsg = "";
     const sb = getSb();
     if (sb) {
       try {
         const { error } = await sb.from("cotizaciones").delete().eq("numero", numero);
-        if (error) {
-          return toast(`No se pudo eliminar en la nube: ${error.message}`, true);
+        if (!error) {
+          cloudDeleted = true;
+        } else {
+          cloudErrorMsg = error.message || "";
+          console.warn("Error eliminando en Supabase:", error);
         }
       } catch (e) {
-        return toast("No se pudo eliminar en la nube: " + (e.message || e), true);
+        cloudErrorMsg = e.message || "";
+        console.warn("Excepción al eliminar en Supabase:", e);
       }
     }
-    DB.setCotizaciones(DB.getCotizaciones().filter(c => c.numero !== numero));
-    toast(`Cotización ${numero} eliminada`);
+
+    // Siempre eliminar de memoria y almacenamiento local
+    const remaining = DB.getCotizaciones().filter(c => String(c.numero || "").trim() !== String(numero).trim());
+    DB.setCotizaciones(remaining);
+    this._editingNumero = null;
+    this._isBusy = false;
+
+    if (sb && !cloudDeleted) {
+      toast(`⚠️ Cotización ${numero} eliminada de este equipo (error en la nube: ${cloudErrorMsg})`, true);
+    } else {
+      toast(`✅ Cotización ${numero} eliminada correctamente`);
+    }
+
     Router.go("guardadas");
   },
 
@@ -2552,22 +2716,27 @@ const Cotizador = {
 
     const filename = `${record.numero}.pdf`;
 
-    // Subir a Supabase Storage (acceso compartido todos los usuarios)
-    const sb = getSb();
-    if (sb) {
-      try {
-        await sb.storage.from("cotizaciones-pdf").upload(filename, blob, { upsert: true });
-      } catch (e) {
-        console.warn("Error subiendo PDF a Supabase Storage:", e);
-      }
+    // 1. Guardar o descargar localmente primero (mientras el gesto de usuario está activo)
+    let savedToFolder = false;
+    try {
+      savedToFolder = await FolderSaver.saveBlob(blob, filename);
+    } catch (e) {
+      console.warn("Error en FolderSaver:", e);
+      FolderSaver._fallbackDownload(blob, filename);
     }
 
-    // Guardar en carpeta local (File System Access API) o descarga normal
-    const savedToFolder = await FolderSaver.saveBlob(blob, filename);
     if (savedToFolder) {
       toast(`✅ PDF ${filename} guardado en tu carpeta configurada`);
     } else {
       toast(`PDF ${filename} descargado`);
+    }
+
+    // 2. Subir a Supabase Storage en segundo plano (no bloquea la descarga ni vence el gesto)
+    const sb = getSb();
+    if (sb) {
+      sb.storage.from("cotizaciones-pdf").upload(filename, blob, { upsert: true }).catch(e => {
+        console.warn("Error subiendo PDF a Supabase Storage:", e);
+      });
     }
   }
 };
