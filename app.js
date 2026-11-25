@@ -83,43 +83,71 @@ const FolderSaver = {
     }
   },
 
-  // API pública: guarda el blob directamente en la carpeta elegida
-  // Retorna true si guardó en carpeta, false si usó descarga normal
-  async saveBlob(blob, filename) {
-    // Si el navegador no soporta la API → descarga normal
+  _withTimeout(promise, ms, label) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(
+        () => reject(new Error("Tiempo de espera agotado" + (label ? " (" + label + ")" : ""))),
+        ms
+      );
+      Promise.resolve(promise).then(
+        v => { clearTimeout(t); resolve(v); },
+        e => { clearTimeout(t); reject(e); }
+      );
+    });
+  },
+
+  // Se llama al instante del clic, con el gesto del usuario todavía activo
+  // (Chrome exige un clic reciente para volver a conceder permiso a la carpeta)
+  async prepare() {
     if (!("showDirectoryPicker" in window)) {
-      this._fallbackDownload(blob, filename);
-      return false;
+      return { mode: "download", reason: "unsupported" };
     }
-
-    let dirHandle = null;
+    let handle = null;
     try {
-      dirHandle = await this._getHandle();
+      handle = await this._withTimeout(this._getHandle(), 3000, "carpeta");
     } catch (e) {
-      console.warn("Error obteniendo handle de carpeta:", e);
+      console.warn("No se pudo leer la carpeta configurada:", e);
     }
+    if (!handle) {
+      return { mode: "download", reason: "no-handle", needsSetup: true };
+    }
+    let granted = false;
+    try {
+      granted = await this._withTimeout(this._verifyPermission(handle, "readwrite"), 4000, "permiso de carpeta");
+    } catch (e) {
+      console.warn("Permiso de carpeta no concedido:", e);
+    }
+    if (!granted) {
+      return { mode: "download", reason: "no-permission", folderName: handle.name };
+    }
+    return { mode: "folder", handle, folderName: handle.name };
+  },
 
-    // Si no hay carpeta guardada o el permiso venció → descargar y sugerir configuración
-    if (!dirHandle || !(await this._verifyPermission(dirHandle, "readwrite"))) {
-      this._fallbackDownload(blob, filename);
-      if (!dirHandle) {
-        this.openModal();
+  // Entrega el PDF: lo escribe en la carpeta elegida o lo descarga.
+  // Nunca se queda colgado: cada paso tiene tiempo máximo.
+  async deliver(blob, filename, prepared) {
+    if (prepared && prepared.mode === "folder") {
+      try {
+        const fileHandle = await this._withTimeout(prepared.handle.getFileHandle(filename, { create: true }), 5000, "archivo");
+        const writable = await this._withTimeout(fileHandle.createWritable(), 5000, "escritura");
+        await this._withTimeout(writable.write(blob), 20000, "datos");
+        await this._withTimeout(writable.close(), 20000, "cierre");
+        return { ok: true, where: "folder", folderName: prepared.folderName || prepared.handle.name || "" };
+      } catch (e) {
+        console.warn("No se pudo escribir en la carpeta; se descarga el PDF:", e);
       }
-      return false;
     }
 
-    // Escribir el archivo directamente en la carpeta seleccionada (COTIZACION NUEVA)
     try {
-      const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
-      const writable = await fileHandle.createWritable();
-      await writable.write(blob);
-      await writable.close();
-      return true;
-    } catch (e) {
-      console.warn("Error escribiendo en carpeta:", e);
       this._fallbackDownload(blob, filename);
-      return false;
+    } catch (e) {
+      console.warn("Error al descargar el PDF:", e);
+      return { ok: false };
     }
+    if (prepared && (prepared.needsSetup || prepared.reason === "no-permission")) {
+      this.openModal();
+    }
+    return { ok: true, where: "download", folderName: prepared && prepared.folderName };
   },
 
   _fallbackDownload(blob, filename) {
@@ -689,13 +717,13 @@ const DEFAULT_OBSERVACIONES =
 const DEFAULT_OBSERVACIONES_PRODUCTOS =
   "Garantía: 1 Año para equipos, 3 Meses para accesorios. Para elementos desechables y/o consumibles solo aplica garantía por defectos de fabricación. La garantía no incluye daños de elementos por desgaste natural, descuido, manipulación o uso indebido y pierde validez si los equipos son reparados, modificados o alterados.";
 
-function toast(msg, isError) {
+function toast(msg, isError, duration) {
   const t = document.getElementById("toast");
   if (!t) return;
   t.textContent = msg;
   t.className = "toast show" + (isError ? " error" : "");
   clearTimeout(toast._h);
-  toast._h = setTimeout(() => t.classList.remove("show"), 3500);
+  toast._h = setTimeout(() => t.classList.remove("show"), duration || 3500);
 }
 
 function fmtCOP(n) {
@@ -2325,8 +2353,9 @@ const Cotizador = {
     return null;
   },
 
-  // Inserta una cotización nueva en la nube, reintentando el consecutivo si choca
-  async _insertCloud(sb, record) {
+  // Inserta una cotización nueva en la nube, reintentando el consecutivo si choca.
+  // allowBump=false (al restaurar una edición) evita crear una copia con otro número.
+  async _insertCloud(sb, record, allowBump = true) {
     let numero = record.numero;
     let row = this.toDbRow({ ...record, numero });
     const badCols = new Set();
@@ -2338,6 +2367,9 @@ const Cotizador = {
       if (!error) return { ok: true, numero };
       lastError = error.message || String(error);
       if (error.code === "23505" || /duplicate key/i.test(lastError)) {
+        if (!allowBump) {
+          return { ok: false, error: `ya existe otra cotización con el número ${numero}` };
+        }
         numero = bumpNumero(numero);
         row = this.toDbRow({ ...record, numero });
         continue;
@@ -2364,7 +2396,7 @@ const Cotizador = {
       if (!error) {
         if (data && data.length) return { ok: true };
         // La cotización ya no existe en la nube: se vuelve a crear con el mismo número
-        return this._insertCloud(sb, record);
+        return this._insertCloud(sb, record, false);
       }
       lastError = error.message || String(error);
       const badCol = this._badColumnFromError(lastError, fullRow);
@@ -2482,15 +2514,37 @@ const Cotizador = {
     )) return;
 
     try {
+      // Preparar la carpeta del PDF de inmediato, mientras el clic del usuario sigue siendo válido
+      // (Chrome exige un clic reciente para conceder el permiso de escritura)
+      let pdfTarget = null;
+      if (withPdf) {
+        pdfTarget = await FolderSaver.prepare();
+      }
+
       await this._waitReady();
       const sb = getSb();
       if (!sb) {
         return toast("Sin conexión con la nube. La cotización NO se guardó; revisa tu internet e intenta de nuevo.", true);
       }
+
       let numero = editNumero || await nextNumeroCloud(sb);
 
       const isShowingImages = Boolean(data.showImages || items.some(it => it.imagen && String(it.imagen).trim().length > 0));
       const record = { numero, ...data, showImages: isShowingImages, items, subtotal, iva, total: subtotal + iva };
+
+      // Generar el PDF antes de tocar la nube: si el PDF falla, no se guarda nada
+      let pdfBlob = null;
+      let pdfNumero = null;
+      if (withPdf) {
+        try {
+          pdfBlob = PdfBuilder.build(record);
+          pdfNumero = record.numero;
+        } catch (e) {
+          console.error("Error generando el PDF:", e);
+          toast("No se pudo generar el PDF: " + (e.message || e) + ". La cotización NO se guardó.", true, 8000);
+          return;
+        }
+      }
 
       const cloudResult = isEdit
         ? await this._updateCloud(sb, record)
@@ -2520,8 +2574,12 @@ const Cotizador = {
       toast(isEdit ? `✅ Cotización ${record.numero} actualizada` : `✅ Cotización ${record.numero} guardada`);
 
       if (withPdf) {
-        const pdfOk = await this.writePdf(record);
-        if (!pdfOk) return;
+        if (pdfNumero !== record.numero) {
+          // El número cambió por un choque en la nube: regenerar el PDF con el número definitivo
+          try { pdfBlob = PdfBuilder.build(record); pdfNumero = record.numero; }
+          catch (e) { console.error("Error regenerando el PDF:", e); }
+        }
+        await this.writePdf(record, pdfBlob, pdfTarget);
       }
 
       Router.go("guardadas");
@@ -2688,34 +2746,34 @@ const Cotizador = {
     }
   },
 
-  async writePdf(record) {
-    let blob;
-    try {
-      blob = PdfBuilder.build(record);
-    } catch (e) {
-      console.error(e);
-      toast("No se pudo generar el PDF: " + (e.message || e), true);
-      return false;
+  async writePdf(record, blob, prepared) {
+    if (!blob) {
+      try {
+        blob = PdfBuilder.build(record);
+      } catch (e) {
+        console.error(e);
+        toast("No se pudo generar el PDF de " + record.numero + ": " + (e.message || e) + ". La cotización sí quedó guardada; corrígela y vuelve a generar el PDF.", true, 9000);
+        return false;
+      }
     }
 
     const filename = `${record.numero}.pdf`;
+    const res = await FolderSaver.deliver(blob, filename, prepared);
 
-    // 1. Guardar o descargar localmente primero (mientras el gesto de usuario está activo)
-    let savedToFolder = false;
-    try {
-      savedToFolder = await FolderSaver.saveBlob(blob, filename);
-    } catch (e) {
-      console.warn("Error en FolderSaver:", e);
-      FolderSaver._fallbackDownload(blob, filename);
+    if (!res.ok) {
+      toast(`⚠️ No se pudo guardar el archivo ${filename}. La cotización sí quedó guardada en la nube; vuelve a intentar el PDF desde "Archivo → Guardar como" o revisa la carpeta configurada.`, true, 9000);
+      return false;
     }
 
-    if (savedToFolder) {
-      toast(`✅ PDF ${filename} guardado en tu carpeta configurada`);
+    if (res.where === "folder") {
+      toast(`✅ PDF ${filename} guardado en la carpeta "${res.folderName}"`, false, 5000);
+    } else if (res.folderName) {
+      toast(`PDF ${filename} descargado (no se pudo escribir en "${res.folderName}")`, false, 7000);
     } else {
-      toast(`PDF ${filename} descargado`);
+      toast(`PDF ${filename} descargado a tu carpeta de Descargas`, false, 6000);
     }
 
-    // 2. Subir a Supabase Storage en segundo plano (no bloquea la descarga ni vence el gesto)
+    // Subir a Supabase Storage en segundo plano
     const sb = getSb();
     if (sb) {
       sb.storage.from("cotizaciones-pdf").upload(filename, blob, { upsert: true }).catch(e => {
