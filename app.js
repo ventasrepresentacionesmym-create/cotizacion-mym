@@ -338,6 +338,7 @@ const DataSync = {
       const eiNombre = this.colIndex(exi.header, "nombre");
       const eiProv = this.colIndex(exi.header, "proveedor");
       const eiIva = this.colIndex(exi.header, "iva");
+      const eiExi = this.colIndex(exi.header, "exi.");
       const eiProm = this.colIndex(exi.header, ["promedio", "costo"]);
 
       for (const r of exi.body) {
@@ -350,7 +351,8 @@ const DataSync = {
         if (!codigo || /^articulo/i.test(codigo)) continue;
 
         const nombre = eiNombre !== -1 ? (r[eiNombre] || "").trim() : (r[1] || "").trim();
-        const proveedor = eiProv !== -1 ? (r[eiProv] || "").trim() : (r[4] || "").trim();
+        const proveedor = eiProv !== -1 ? (r[eiProv] || "").trim() : "";
+        const existencia = eiExi !== -1 ? this.toFloat(r[eiExi]) : 0;
         let ivaPct = 0;
         if (eiIva !== -1) {
           const rawIva = (r[eiIva] || "").toUpperCase();
@@ -368,13 +370,14 @@ const DataSync = {
             codigo,
             descripcion: nombre || codigo,
             iva_pct: ivaPct,
-            existencia: 0,
+            existencia,
             costo,
             proveedor
           });
         } else {
           const p = products.get(codigo);
           if (costo > p.costo) p.costo = costo;
+          if (eiExi !== -1) p.existencia = existencia;
           if (!p.proveedor && proveedor) p.proveedor = proveedor;
           if (!p.iva_pct && ivaPct) p.iva_pct = ivaPct;
           if (nombre && !p.descripcion) p.descripcion = nombre;
@@ -393,6 +396,8 @@ const DataSync = {
       let nombre = (cells[1] || "").replace(/^[, \t\r\n]+/, "").trim();
       const ciudad = (cells[3] || "").trim();
       const nit = (cells[5] || "").trim();
+      // Descartar la fila de encabezado del reporte (Nombre / Ciudad / Nit)
+      if (/^(nombre|clave)$/i.test(nombre) || /^nit$/i.test(nit)) continue;
       if (!nombre || /^TOTAL/i.test(nombre) || /^Directorio/i.test(nombre)) continue;
       clientes.push({ nombre, ciudad, nit });
     }
@@ -411,8 +416,21 @@ const DataSync = {
   },
 
   async syncFromFolder(onProgress) {
-    let dirHandle = await this.getSavedFolder();
-    if (!dirHandle || !(await FolderSaver._verifyPermission(dirHandle, "read"))) {
+    let dirHandle = null;
+    try {
+      dirHandle = await FolderSaver._withTimeout(this.getSavedFolder(), 3000, "carpeta de datos");
+    } catch (e) {
+      console.warn("No se pudo leer la carpeta de datos:", e);
+    }
+    let permisoOk = false;
+    if (dirHandle) {
+      try {
+        permisoOk = await FolderSaver._withTimeout(FolderSaver._verifyPermission(dirHandle, "read"), 4000, "permiso de carpeta");
+      } catch (e) {
+        console.warn("Permiso de carpeta de datos no concedido:", e);
+      }
+    }
+    if (!dirHandle || !permisoOk) {
       dirHandle = await this.pickFolder();
     }
 
@@ -510,10 +528,22 @@ const DataSync = {
     return rows;
   },
 
+  async _countTable(table) {
+    const sb = getSb();
+    const { count, error } = await sb.from(table).select("id", { count: "exact", head: true });
+    if (error) throw new Error(`No se pudo verificar la tabla ${table}: ${error.message}`);
+    return Number(count) || 0;
+  },
+
   async _clearTable(table) {
     const sb = getSb();
     const { error } = await sb.from(table).delete().neq("id", "00000000-0000-0000-0000-000000000000");
     if (error) throw new Error(`No se pudo vaciar la tabla ${table}: ${error.message}`);
+    // Si la nube rechazó el borrado (permisos), lo dice sin error: se verifica antes de insertar
+    const restantes = await this._countTable(table);
+    if (restantes > 0) {
+      throw new Error(`La nube rechazó el vaciado de ${table} (quedan ${restantes} registros). No se insertó nada nuevo.`);
+    }
   },
 
   async _insertChunks(table, rows, onRow) {
@@ -527,18 +557,33 @@ const DataSync = {
     }
   },
 
-  async _restoreBackup(backupProd, backupClie) {
-    try {
-      await this._clearTable("productos");
-      await this._clearTable("clientes");
-      if (backupProd.length) await this._insertChunks("productos", backupProd);
-      if (backupClie.length) await this._insertChunks("clientes", backupClie);
-    } catch (e) {
-      console.error("Error restaurando respaldo:", e);
+  async _restoreBackup(backupProd, backupClie, tablasVaciadas) {
+    // Solo se restaura lo que realmente llegó a borrarse, para no duplicar datos
+    let todoOk = true;
+    for (const table of tablasVaciadas || ["productos", "clientes"]) {
+      try {
+        await this._clearTable(table);
+        const rows = table === "productos" ? backupProd : backupClie;
+        if (rows && rows.length) await this._insertChunks(table, rows);
+      } catch (e) {
+        todoOk = false;
+        console.error("Error restaurando respaldo de " + table + ":", e);
+      }
     }
+    return todoOk;
   },
 
   async uploadToSupabase(htmlArt, htmlProd, htmlClie, onProgress) {
+    if (this._syncing) throw new Error("Ya hay una sincronización en curso. Espera a que termine antes de volver a intentar.");
+    this._syncing = true;
+    try {
+      return await this._uploadToSupabase(htmlArt, htmlProd, htmlClie, onProgress);
+    } finally {
+      this._syncing = false;
+    }
+  },
+
+  async _uploadToSupabase(htmlArt, htmlProd, htmlClie, onProgress) {
     const sb = getSb();
     if (!sb) throw new Error("No hay conexión con Supabase.");
 
@@ -560,11 +605,14 @@ const DataSync = {
 
     const totalRecords = productos.length + clientes.length;
     let processedRecords = 0;
+    const vaciadas = [];
 
     try {
       onProgress({ pct: 30, msg: "Preparando base de datos en la nube..." });
       await this._clearTable("productos");
+      vaciadas.push("productos");
       await this._clearTable("clientes");
+      vaciadas.push("clientes");
 
       await this._insertChunks("productos", productos, done => {
         processedRecords = done;
@@ -583,9 +631,15 @@ const DataSync = {
         });
       });
     } catch (e) {
-      onProgress({ pct: 60, msg: "Ocurrió un error, restaurando el respaldo anterior..." });
-      await this._restoreBackup(backupProd, backupClie);
-      throw new Error(e.message + " Se restauró la información anterior.");
+      let mensajeRestaurado = "";
+      if (vaciadas.length) {
+        onProgress({ pct: 60, msg: "Ocurrió un error, restaurando el respaldo anterior..." });
+        const restaurado = await this._restoreBackup(backupProd, backupClie, vaciadas);
+        mensajeRestaurado = restaurado
+          ? " Se restauró la información anterior."
+          : " ⚠️ No se pudo restaurar automáticamente el respaldo; vuelve a sincronizar para completar los datos.";
+      }
+      throw new Error(e.message + mensajeRestaurado);
     }
 
     onProgress({ pct: 95, msg: "Recargando catálogo actualizado..." });
@@ -1082,7 +1136,7 @@ const AppInit = {
         badge.style.background = "#fffbeb";
         badge.style.borderColor = "#fde68a";
       }
-      return;
+      return false;
     }
 
     try {
@@ -1226,6 +1280,7 @@ const AppInit = {
         badge.style.background = "";
         badge.style.borderColor = "";
       }
+      return true;
     } catch (e) {
       console.error("Error sincronizando con Supabase:", e);
       if (badge) {
@@ -1234,6 +1289,7 @@ const AppInit = {
         badge.style.background = "#fef2f2";
         badge.style.borderColor = "#fecaca";
       }
+      return false;
     }
   },
 
@@ -1329,7 +1385,7 @@ Views.renderActualizarExcel = async function () {
   const hasFSA = ("showDirectoryPicker" in window);
   let savedFolder = null;
   if (hasFSA) {
-    try { savedFolder = await DataSync.getSavedFolder(); } catch {}
+    try { savedFolder = await FolderSaver._withTimeout(DataSync.getSavedFolder(), 2500, "carpeta de datos"); } catch {}
   }
   const folderName = savedFolder ? savedFolder.name : null;
 
@@ -1431,7 +1487,9 @@ Views.renderActualizarExcel = async function () {
   // Sincronización desde Carpeta (Dropbox)
   if (btnSync) {
     btnSync.addEventListener("click", async () => {
+      const origLabel = btnSync.textContent;
       btnSync.disabled = true;
+      btnSync.textContent = "Sincronizando...";
       if (btnChange) btnChange.disabled = true;
       if (btnReload) btnReload.disabled = true;
 
@@ -1452,6 +1510,7 @@ Views.renderActualizarExcel = async function () {
         toast(err.message, true);
       } finally {
         btnSync.disabled = false;
+        btnSync.textContent = origLabel;
         if (btnChange) btnChange.disabled = false;
         if (btnReload) btnReload.disabled = false;
         hideProgress();
@@ -1508,8 +1567,19 @@ Views.renderActualizarExcel = async function () {
       btnReload.disabled = true;
       btnReload.textContent = "Recargando...";
       try {
-        await AppInit.boot();
+        // Comprobar primero que la nube responde, para no mostrar una recarga vacía como si fuera éxito
+        const sb = getSb();
+        const probe = sb ? await sb.from("productos").select("codigo", { count: "exact", head: true }) : { error: true };
+        if (!sb || probe.error) {
+          toast("No se pudo recargar desde la nube: la conexión falló. Revisa tu internet e intenta de nuevo.", true);
+          return;
+        }
+        const ok = await AppInit.boot();
         refreshMetrics();
+        if (!ok) {
+          toast("No se pudo recargar desde la nube. Revisa tu internet e intenta de nuevo.", true);
+          return;
+        }
         const pCount = (STATE.datos || []).length;
         const cCount = ((STATE.cyp && STATE.cyp.clientes) || []).length;
         toast(`Datos recargados: ${pCount.toLocaleString("es-CO")} productos y ${cCount.toLocaleString("es-CO")} clientes.`);
